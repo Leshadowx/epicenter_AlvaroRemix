@@ -1,5 +1,5 @@
 import { appDataDir, join } from '@tauri-apps/api/path';
-import { exists, remove, writeFile } from '@tauri-apps/plugin-fs';
+import { createDir, exists, readDir, remove, writeFile } from '@tauri-apps/plugin-fs';
 import { nanoid } from 'nanoid/non-secure';
 import { createTaggedError, extractErrorMessage } from 'wellcrafted/error';
 import { Err, Ok, tryAsync } from 'wellcrafted/result';
@@ -139,6 +139,114 @@ export const FfmpegServiceLive = {
 				}),
 		});
 	},
+
+	/**
+	 * Splits an audio blob into multiple segments using FFmpeg, re-encoding to MP3.
+	 * Segment duration is calculated from target size and bitrate.
+	 */
+	async splitAudioBlob(
+		blob: Blob,
+		options: {
+			maxMb: number;
+			bitrateKbps: number;
+			minChunkSec: number;
+			safetyMb: number;
+		},
+	) {
+		return await tryAsync({
+			try: async () => {
+				const sessionId = nanoid();
+				const tempDir = await appDataDir();
+				const inputPath = await join(
+					tempDir,
+					`split_input_${sessionId}.wav`,
+				);
+				const outputDir = await join(tempDir, `split_output_${sessionId}`);
+				const outputPattern = await join(
+					outputDir,
+					`split_part_%03d.mp3`,
+				);
+
+				const targetBytes = (options.maxMb - options.safetyMb) * 1024 * 1024;
+				const bytesPerSec = (options.bitrateKbps * 1000) / 8;
+				const chunkSecs = Math.max(
+					options.minChunkSec,
+					Math.floor(targetBytes / bytesPerSec),
+				);
+
+				try {
+					const inputContents = new Uint8Array(await blob.arrayBuffer());
+					await writeFile(inputPath, inputContents);
+
+					await createDir(outputDir, { recursive: true });
+
+					const command = buildSplitCommand({
+						inputPath,
+						outputPattern,
+						bitrateKbps: options.bitrateKbps,
+						chunkSecs,
+					});
+
+					const { data: result, error: commandError } =
+						await CommandServiceLive.execute(asShellCommand(command));
+					if (commandError) {
+						throw new Error(`FFmpeg split failed: ${commandError.message}`);
+					}
+
+					if (result.code !== 0) {
+						throw new Error(
+							`FFmpeg split failed with exit code ${result.code}: ${result.stderr}`,
+						);
+					}
+
+					const entries = await readDir(outputDir);
+					const outputFiles = (
+						await Promise.all(
+							entries
+								.filter((entry) => entry.name?.endsWith('.mp3'))
+								.map((entry) => join(outputDir, entry.name ?? '')),
+						)
+					).sort();
+
+					if (outputFiles.length === 0) {
+						throw new Error('FFmpeg split completed but no output files found');
+					}
+
+					const { data: blobs, error: readError } = await tryAsync({
+						try: () =>
+							Promise.all(
+								outputFiles.map((path) => FsServiceLive.pathToBlob(path)),
+							),
+						catch: (error) =>
+							FfmpegServiceErr({
+								message: `Failed to read split audio files: ${extractErrorMessage(error)}`,
+							}),
+					});
+					if (readError) throw new Error(readError.message);
+
+					const failedRead = blobs.find((result) => result.error);
+					if (failedRead?.error) {
+						throw new Error(failedRead.error.message);
+					}
+
+					return blobs.map((result) => result.data ?? new Blob());
+				} finally {
+					await tryAsync({
+						try: async () => {
+							if (await exists(inputPath)) await remove(inputPath);
+							if (await exists(outputDir))
+								await remove(outputDir, { recursive: true });
+						},
+						catch: () => Ok(undefined),
+					});
+				}
+			},
+			catch: (error) =>
+				FfmpegServiceErr({
+					message: `Audio split failed: ${extractErrorMessage(error)}`,
+				}),
+		});
+	},
 };
 
 export type FfmpegService = typeof FfmpegServiceLive;
@@ -173,6 +281,41 @@ function buildCompressionCommand({
 		compressionOptions.trim(),
 		`"${outputPath}"`,
 	].filter((part) => part); // Remove empty strings
+
+	return parts.join(' ');
+}
+
+function buildSplitCommand({
+	inputPath,
+	outputPattern,
+	bitrateKbps,
+	chunkSecs,
+}: {
+	inputPath: string;
+	outputPattern: string;
+	bitrateKbps: number;
+	chunkSecs: number;
+}) {
+	const parts = [
+		'ffmpeg',
+		'-y',
+		'-i',
+		`"${inputPath}"`,
+		'-vn',
+		'-acodec',
+		'libmp3lame',
+		'-b:a',
+		`"${bitrateKbps}k"`,
+		'-map_metadata',
+		'-1',
+		'-f',
+		'segment',
+		'-segment_time',
+		`"${chunkSecs}"`,
+		'-reset_timestamps',
+		'1',
+		`"${outputPattern}"`,
+	].filter((part) => part);
 
 	return parts.join(' ');
 }

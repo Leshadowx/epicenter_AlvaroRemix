@@ -3,10 +3,15 @@ import { defineMutation, queryClient } from '$lib/query/client';
 import { WhisperingErr, type WhisperingError } from '$lib/result';
 import { desktopServices, services } from '$lib/services';
 import type { Recording } from '$lib/services/isomorphic/db';
+import { splitAudioDialog } from '$lib/stores/split-audio-dialog.svelte';
 import { settings } from '$lib/stores/settings.svelte';
+import type { Settings } from '$lib/settings';
 import { rpc } from '..';
 import { db } from './db';
 import { notify } from './notify';
+
+const MAX_TRANSCRIPTION_FILE_MB = 25;
+const MB_BYTES = 1024 * 1024;
 
 const transcriptionKeys = {
 	isTranscribing: ['transcription', 'isTranscribing'] as const,
@@ -173,116 +178,41 @@ async function transcribeBlob(
 		}
 	}
 
-	const transcriptionResult: Result<string, WhisperingError> =
-		await (async () => {
-			switch (selectedService) {
-				case 'OpenAI':
-					return await services.transcriptions.openai.transcribe(
-						audioToTranscribe,
-						{
-							outputLanguage: settings.value['transcription.outputLanguage'],
-							prompt: settings.value['transcription.prompt'],
-							temperature: settings.value['transcription.temperature'],
-							apiKey: settings.value['apiKeys.openai'],
-							modelName: settings.value['transcription.openai.model'],
-							baseURL: settings.value['apiEndpoints.openai'] || undefined,
-						},
-					);
-				case 'Groq':
-					return await services.transcriptions.groq.transcribe(
-						audioToTranscribe,
-						{
-							outputLanguage: settings.value['transcription.outputLanguage'],
-							prompt: settings.value['transcription.prompt'],
-							temperature: settings.value['transcription.temperature'],
-							apiKey: settings.value['apiKeys.groq'],
-							modelName: settings.value['transcription.groq.model'],
-							baseURL: settings.value['apiEndpoints.groq'] || undefined,
-						},
-					);
-				case 'speaches':
-					return await services.transcriptions.speaches.transcribe(
-						audioToTranscribe,
-						{
-							outputLanguage: settings.value['transcription.outputLanguage'],
-							prompt: settings.value['transcription.prompt'],
-							temperature: settings.value['transcription.temperature'],
-							modelId: settings.value['transcription.speaches.modelId'],
-							baseUrl: settings.value['transcription.speaches.baseUrl'],
-						},
-					);
-				case 'ElevenLabs':
-					return await services.transcriptions.elevenlabs.transcribe(
-						audioToTranscribe,
-						{
-							outputLanguage: settings.value['transcription.outputLanguage'],
-							prompt: settings.value['transcription.prompt'],
-							temperature: settings.value['transcription.temperature'],
-							apiKey: settings.value['apiKeys.elevenlabs'],
-							modelName: settings.value['transcription.elevenlabs.model'],
-						},
-					);
-				case 'Deepgram':
-					return await services.transcriptions.deepgram.transcribe(
-						audioToTranscribe,
-						{
-							outputLanguage: settings.value['transcription.outputLanguage'],
-							prompt: settings.value['transcription.prompt'],
-							temperature: settings.value['transcription.temperature'],
-							apiKey: settings.value['apiKeys.deepgram'],
-							modelName: settings.value['transcription.deepgram.model'],
-						},
-					);
-				case 'Mistral':
-					return await services.transcriptions.mistral.transcribe(
-						audioToTranscribe,
-						{
-							outputLanguage: settings.value['transcription.outputLanguage'],
-							prompt: settings.value['transcription.prompt'],
-							temperature: settings.value['transcription.temperature'],
-							apiKey: settings.value['apiKeys.mistral'],
-							modelName: settings.value['transcription.mistral.model'],
-						},
-					);
-				case 'whispercpp': {
-					// Pure Rust audio conversion now handles most formats without FFmpeg
-					// Only compressed formats (MP3, M4A) require FFmpeg, which will be
-					// handled automatically as a fallback in the Rust conversion pipeline
-					return await services.transcriptions.whispercpp.transcribe(
-						audioToTranscribe,
-						{
-							outputLanguage: settings.value['transcription.outputLanguage'],
-							modelPath: settings.value['transcription.whispercpp.modelPath'],
-							prompt: settings.value['transcription.prompt'],
-						},
-					);
-				}
-				case 'parakeet': {
-					// Pure Rust audio conversion now handles most formats without FFmpeg
-					// Only compressed formats (MP3, M4A) require FFmpeg, which will be
-					// handled automatically as a fallback in the Rust conversion pipeline
-					return await services.transcriptions.parakeet.transcribe(
-						audioToTranscribe,
-						{ modelPath: settings.value['transcription.parakeet.modelPath'] },
-					);
-				}
-				case 'moonshine': {
-					// Moonshine uses ONNX Runtime with encoder-decoder architecture
-					// Variant is extracted from modelPath (e.g., "moonshine-tiny-en" → "tiny")
-					return await services.transcriptions.moonshine.transcribe(
-						audioToTranscribe,
-						{
-							modelPath: settings.value['transcription.moonshine.modelPath'],
-						},
-					);
-				}
-				default:
-					return WhisperingErr({
-						title: '⚠️ No transcription service selected',
-						description: 'Please select a transcription service in settings.',
-					});
-			}
-		})();
+	const requiresSplit = blob.size > MAX_TRANSCRIPTION_FILE_MB * MB_BYTES;
+	let transcriptionResult: Result<string, WhisperingError>;
+
+	if (requiresSplit) {
+		const splitOptions = await splitAudioDialog.open({
+			blob,
+			blobSizeMb: blob.size / MB_BYTES,
+			options: {
+				maxMb: settings.value['transcription.splitMaxMB'],
+				bitrateKbps: settings.value['transcription.splitBitrateKbps'],
+				minChunkSec: settings.value['transcription.splitMinChunkSec'],
+				safetyMb: settings.value['transcription.splitSafetyMB'],
+				addSplitTags: settings.value['transcription.splitTaggingEnabled'],
+			},
+		});
+
+		if (!splitOptions) {
+			transcriptionResult = WhisperingErr({
+				title: 'Split canceled',
+				description:
+					'Transcription was canceled because the audio file exceeds 25MB.',
+			});
+		} else {
+			transcriptionResult = await transcribeSplitAudio(
+				blob,
+				splitOptions,
+				selectedService,
+			);
+		}
+	} else {
+		transcriptionResult = await transcribeWithProvider(
+			audioToTranscribe,
+			selectedService,
+		);
+	}
 
 	// Log transcription result
 	const duration = Date.now() - startTime;
@@ -302,4 +232,183 @@ async function transcribeBlob(
 	}
 
 	return transcriptionResult;
+}
+
+async function transcribeSplitAudio(
+	blob: Blob,
+	options: {
+		maxMb: number;
+		bitrateKbps: number;
+		minChunkSec: number;
+		safetyMb: number;
+		addSplitTags: boolean;
+	},
+	selectedService: Settings['transcription.selectedTranscriptionService'],
+): Promise<Result<string, WhisperingError>> {
+	const { data: splitBlobs, error: splitError } =
+		await desktopServices.ffmpeg.splitAudioBlob(blob, {
+			maxMb: options.maxMb,
+			bitrateKbps: options.bitrateKbps,
+			minChunkSec: options.minChunkSec,
+			safetyMb: options.safetyMb,
+		});
+
+	if (splitError) {
+		return WhisperingErr({
+			title: 'Audio split failed',
+			serviceError: splitError,
+		});
+	}
+
+	const chunkSeconds = calculateChunkSeconds(options);
+	const merged: string[] = [];
+
+	for (let index = 0; index < splitBlobs.length; index += 1) {
+		const chunk = splitBlobs[index];
+		if (!chunk) continue;
+
+		const { data: text, error: chunkError } = await transcribeWithProvider(
+			chunk,
+			selectedService,
+		);
+
+		if (chunkError) return Err(chunkError);
+
+		if (options.addSplitTags) {
+			const start = index * chunkSeconds;
+			const end = (index + 1) * chunkSeconds;
+			merged.push(formatSplitTag(index + 1, start, end));
+		}
+
+		merged.push(text.trim());
+	}
+
+	return Ok(merged.join('\n\n'));
+}
+
+async function transcribeWithProvider(
+	audioToTranscribe: Blob,
+	selectedService: Settings['transcription.selectedTranscriptionService'],
+): Promise<Result<string, WhisperingError>> {
+	switch (selectedService) {
+		case 'OpenAI':
+			return await services.transcriptions.openai.transcribe(audioToTranscribe, {
+				outputLanguage: settings.value['transcription.outputLanguage'],
+				prompt: settings.value['transcription.prompt'],
+				temperature: settings.value['transcription.temperature'],
+				apiKey: settings.value['apiKeys.openai'],
+				modelName: settings.value['transcription.openai.model'],
+				baseURL: settings.value['apiEndpoints.openai'] || undefined,
+			});
+		case 'Groq':
+			return await services.transcriptions.groq.transcribe(audioToTranscribe, {
+				outputLanguage: settings.value['transcription.outputLanguage'],
+				prompt: settings.value['transcription.prompt'],
+				temperature: settings.value['transcription.temperature'],
+				apiKey: settings.value['apiKeys.groq'],
+				modelName: settings.value['transcription.groq.model'],
+				baseURL: settings.value['apiEndpoints.groq'] || undefined,
+			});
+		case 'speaches':
+			return await services.transcriptions.speaches.transcribe(
+				audioToTranscribe,
+				{
+					outputLanguage: settings.value['transcription.outputLanguage'],
+					prompt: settings.value['transcription.prompt'],
+					temperature: settings.value['transcription.temperature'],
+					modelId: settings.value['transcription.speaches.modelId'],
+					baseUrl: settings.value['transcription.speaches.baseUrl'],
+				},
+			);
+		case 'ElevenLabs':
+			return await services.transcriptions.elevenlabs.transcribe(
+				audioToTranscribe,
+				{
+					outputLanguage: settings.value['transcription.outputLanguage'],
+					prompt: settings.value['transcription.prompt'],
+					temperature: settings.value['transcription.temperature'],
+					apiKey: settings.value['apiKeys.elevenlabs'],
+					modelName: settings.value['transcription.elevenlabs.model'],
+				},
+			);
+		case 'Deepgram':
+			return await services.transcriptions.deepgram.transcribe(
+				audioToTranscribe,
+				{
+					outputLanguage: settings.value['transcription.outputLanguage'],
+					prompt: settings.value['transcription.prompt'],
+					temperature: settings.value['transcription.temperature'],
+					apiKey: settings.value['apiKeys.deepgram'],
+					modelName: settings.value['transcription.deepgram.model'],
+				},
+			);
+		case 'Mistral':
+			return await services.transcriptions.mistral.transcribe(
+				audioToTranscribe,
+				{
+					outputLanguage: settings.value['transcription.outputLanguage'],
+					prompt: settings.value['transcription.prompt'],
+					temperature: settings.value['transcription.temperature'],
+					apiKey: settings.value['apiKeys.mistral'],
+					modelName: settings.value['transcription.mistral.model'],
+				},
+			);
+		case 'whispercpp': {
+			return await services.transcriptions.whispercpp.transcribe(
+				audioToTranscribe,
+				{
+					outputLanguage: settings.value['transcription.outputLanguage'],
+					modelPath: settings.value['transcription.whispercpp.modelPath'],
+					prompt: settings.value['transcription.prompt'],
+				},
+			);
+		}
+		case 'parakeet': {
+			return await services.transcriptions.parakeet.transcribe(
+				audioToTranscribe,
+				{ modelPath: settings.value['transcription.parakeet.modelPath'] },
+			);
+		}
+		case 'moonshine': {
+			return await services.transcriptions.moonshine.transcribe(
+				audioToTranscribe,
+				{
+					modelPath: settings.value['transcription.moonshine.modelPath'],
+				},
+			);
+		}
+		default:
+			return WhisperingErr({
+				title: '⚠️ No transcription service selected',
+				description: 'Please select a transcription service in settings.',
+			});
+	}
+}
+
+function calculateChunkSeconds(options: {
+	maxMb: number;
+	bitrateKbps: number;
+	minChunkSec: number;
+	safetyMb: number;
+}) {
+	const targetBytes = (options.maxMb - options.safetyMb) * MB_BYTES;
+	const bytesPerSecond = (options.bitrateKbps * 1000) / 8;
+	return Math.max(options.minChunkSec, Math.floor(targetBytes / bytesPerSecond));
+}
+
+function formatSplitTag(index: number, startSeconds: number, endSeconds: number) {
+	return `[Chunk ${index} • ${formatTimestamp(startSeconds)} – ${formatTimestamp(
+		endSeconds,
+	)}]`;
+}
+
+function formatTimestamp(totalSeconds: number) {
+	const clampedSeconds = Math.max(0, Math.floor(totalSeconds));
+	const hours = Math.floor(clampedSeconds / 3600);
+	const minutes = Math.floor((clampedSeconds % 3600) / 60);
+	const seconds = clampedSeconds % 60;
+	const hourPrefix = hours > 0 ? `${String(hours).padStart(2, '0')}:` : '';
+	return `${hourPrefix}${String(minutes).padStart(2, '0')}:${String(
+		seconds,
+	).padStart(2, '0')}`;
 }
