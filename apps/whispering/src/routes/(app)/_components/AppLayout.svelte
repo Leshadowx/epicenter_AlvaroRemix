@@ -8,6 +8,7 @@
 	import ConfirmationDialog from '$lib/components/ConfirmationDialog.svelte';
 	import MoreDetailsDialog from '$lib/components/MoreDetailsDialog.svelte';
 	import NotificationLog from '$lib/components/NotificationLog.svelte';
+	import SplitLargeAudioDialog from '$lib/components/transcription/SplitLargeAudioDialog.svelte';
 	import UpdateDialog from '$lib/components/UpdateDialog.svelte';
 	import { rpc } from '$lib/query';
 	import { vadRecorder } from '$lib/stores/vad-recorder.svelte';
@@ -114,4 +115,5 @@
 <ConfirmationDialog />
 <MoreDetailsDialog />
 <NotificationLog />
+<SplitLargeAudioDialog />
 <UpdateDialog />

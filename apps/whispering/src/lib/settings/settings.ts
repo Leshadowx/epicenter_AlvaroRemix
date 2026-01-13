@@ -180,6 +180,12 @@ export const Settings = type({
 	'transcription.compressionOptions': type('string').default(
 		FFMPEG_DEFAULT_COMPRESSION_OPTIONS,
 	),
+	// Audio split settings (for large file uploads)
+	'transcription.splitMaxMB': type('number').default(25),
+	'transcription.splitBitrateKbps': type('number').default(128),
+	'transcription.splitMinChunkSec': type('number').default(10),
+	'transcription.splitSafetyMB': type('number').default(0.5),
+	'transcription.splitTaggingEnabled': 'boolean = true',
 
 	// Service-specific settings
 	'transcription.openai.model': type('string')
